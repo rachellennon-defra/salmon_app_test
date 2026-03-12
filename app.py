@@ -188,5 +188,84 @@ if st.button("🚀 Start Inference"):
                         with open(temp_path, "rb") as f:
                             st.video(f.read(), format="video/mp4")
 
+                        # ------------------------------------------------
+                        # Show annotated video with bounding boxes
+                        # ------------------------------------------------
+                        st.markdown("### 🟥 Video with Model Predictions")
+
+                        # Filter predictions for this video
+                        video_preds = preds_df[preds_df["video"] == selected_video].copy()
+
+                        if video_preds.empty:
+                            st.info("No detections found for this video.")
+                        else:
+                            # Temporary working directory for annotated frames/video
+                            work_dir = tempfile.mkdtemp(prefix="annot_frames_")
+                            frames_dir = os.path.join(work_dir, "frames")
+                            annotated_dir = os.path.join(work_dir, "annotated")
+                            os.makedirs(frames_dir, exist_ok=True)
+                            os.makedirs(annotated_dir, exist_ok=True)
+
+                            # Extract frames with ffmpeg
+                            extract_cmd = [
+                                "ffmpeg",
+                                "-i", temp_path,
+                                os.path.join(frames_dir, "frame_%06d.jpg"),
+                                "-hide_banner", "-loglevel", "error"
+                            ]
+                            subprocess.run(extract_cmd, check=True)
+
+                            # -------------------------------------------
+                            # Draw bounding boxes
+                            # -------------------------------------------
+                            frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+
+                            for frame_file in frame_files:
+                                frame_num = int(frame_file.split("_")[1].split(".")[0])
+
+                                frame_path = os.path.join(frames_dir, frame_file)
+                                img = Image.open(frame_path).convert("RGB")
+                                draw = ImageDraw.Draw(img)
+
+                                # Predictions for this frame
+                                frame_preds = video_preds[video_preds["frame"] == frame_num]
+
+                                for _, row in frame_preds.iterrows():
+                                    x1, y1, x2, y2 = row["xmin"], row["ymin"], row["xmax"], row["ymax"]
+
+                                    # Draw bounding box
+                                    draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+
+                                    # Optional: draw label
+                                    label = row.get("track_id", "fish")
+                                    draw.text((x1, y1 - 10), str(label), fill="red")
+
+                                # Save annotated frame
+                                img.save(os.path.join(annotated_dir, frame_file))
+
+                            # -------------------------------------------
+                            # Reassemble into video
+                            # -------------------------------------------
+                            annotated_video_path = os.path.join(work_dir, "annotated.mp4")
+
+                            annotate_cmd = [
+                                "ffmpeg",
+                                "-framerate", "25",
+                                "-i", os.path.join(annotated_dir, "frame_%06d.jpg"),
+                                "-c:v", "libx264",
+                                "-pix_fmt", "yuv420p",
+                                annotated_video_path,
+                                "-hide_banner", "-loglevel", "error"
+                            ]
+                            subprocess.run(annotate_cmd, check=True)
+
+                            # -------------------------------------------
+                            # Display annotated video
+                            # -------------------------------------------
+                            with open(annotated_video_path, "rb") as f:
+                                st.video(f.read(), format="video/mp4")
+
+                            st.success("Annotated QC video generated!")
+
             except Exception as e:
                 st.error(f"Error saving: {e}")
