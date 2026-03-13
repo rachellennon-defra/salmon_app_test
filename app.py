@@ -614,6 +614,7 @@ with tab_review:
 # TAB 3 — SUMMARY
 ####################################
 
+
 with tab_summary:
     summary_df = st.session_state.get("summary_df")
 
@@ -656,6 +657,18 @@ with tab_summary:
                 <div class="kpi-value">{avg_per_video}</div>
             </div>
             """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        csv = summary_df.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="⬇️ Download Summary CSV",
+            data=csv,
+            file_name="fish_count_summary.csv",
+            mime="text/csv",
+            key="download_summary_csv"
+        )
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.dataframe(summary_df, use_container_width=True)

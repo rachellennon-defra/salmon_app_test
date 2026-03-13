@@ -11,9 +11,9 @@ id = '4b4801ba-9db7-4bd0-ab2e-2758181c644e'
 dashboard_url = 'https://dash-connect-prd.azure.defra.cloud/connect/#/apps/4b4801ba-9db7-4bd0-ab2e-2758181c644e'
 direct_url = 'https://dash-connect-prd.azure.defra.cloud/content/4b4801ba-9db7-4bd0-ab2e-2758181c644e/'
 logs_url = 'https://dash-connect-prd.azure.defra.cloud/connect/#/apps/4b4801ba-9db7-4bd0-ab2e-2758181c644e/logs'
-deployed_at = '2026-03-13T16:08:31Z'
-bundle_id = '2261'
-bundle_url = 'https://dash-connect-prd.azure.defra.cloud/__api__/v1/content/4b4801ba-9db7-4bd0-ab2e-2758181c644e/bundles/2261/download'
+deployed_at = '2026-03-13T16:39:46Z'
+bundle_id = '2264'
+bundle_url = 'https://dash-connect-prd.azure.defra.cloud/__api__/v1/content/4b4801ba-9db7-4bd0-ab2e-2758181c644e/bundles/2264/download'
 files = [
   '.posit/publish/deployments/deployment-BQIA.toml',
   '.posit/publish/salmon_app_test-BQGS.toml',
