@@ -1,48 +1,123 @@
-
 #######################################################################################
 # Spotting Salmon App
 # Written by: Rachel Lennon & co-pilot troubleshooting
-# Purpose: A UI for detecting and counting wild salmon from EA monitoring sites.
 #######################################################################################
 
 ####################################
-# SET UP
+# IMPORTS
 ####################################
 
-# Import packages
 import os
 import io
 import zipfile
+import tempfile
+import shutil
+import atexit
+
+import cv2
+import pandas as pd
 import numpy as np
 import streamlit as st
-from pathlib import Path
-from PIL import Image
-import pandas as pd
 from databricks.sdk import WorkspaceClient
-import tempfile, shutil
-import subprocess
-from PIL import Image, ImageDraw
 
 ####################################
-# OPEN PAGE
+# PAGE CONFIG
 ####################################
 
-# Title
 st.set_page_config(page_title="Spotting Salmon", layout="wide")
 st.title("🐟 SpottingSalmon – Video Fish Counter")
-
 st.subheader("🔍 Upload Monitoring Videos")
 
+####################################
+# HELPERS
+####################################
+
+def safe_rmtree(path):
+    try:
+        if path and os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+    except:
+        pass
+
+def register_cleanup_once():
+    if not st.session_state.get("_cleanup_registered"):
+        def cleanup():
+            safe_rmtree(st.session_state.get("temp_base_folder"))
+        atexit.register(cleanup)
+        st.session_state["_cleanup_registered"] = True
+
+def coerce_numeric(df, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+def standardise_bbox_columns(df):
+    """
+    Map model bbox columns to xmin/ymin/xmax/ymax if needed.
+    Only adds these columns when x1/y1/x2/y2 exist.
+    """
+    if {"xmin", "ymin", "xmax", "ymax"}.issubset(df.columns):
+        return df
+
+    if {"x1", "y1", "x2", "y2"}.issubset(df.columns):
+        df = df.copy()
+        df["xmin"] = df["x1"]
+        df["ymin"] = df["y1"]
+        df["xmax"] = df["x2"]
+        df["ymax"] = df["y2"]
+
+    return df
+
+def maybe_scale_bboxes(df, w, h):
+    """If boxes look normalized (<=1.5), scale to pixel coords in-place."""
+    needed = {"xmin","ymin","xmax","ymax"}
+    if not needed.issubset(df.columns):
+        return df
+    max_x = pd.concat([df["xmin"], df["xmax"]], axis=1).max(axis=1).max()
+    max_y = pd.concat([df["ymin"], df["ymax"]], axis=1).max(axis=1).max()
+    if pd.notnull(max_x) and pd.notnull(max_y) and max_x <= 1.5 and max_y <= 1.5:
+        df["xmin"] = (df["xmin"] * w).round()
+        df["xmax"] = (df["xmax"] * w).round()
+        df["ymin"] = (df["ymin"] * h).round()
+        df["ymax"] = (df["ymax"] * h).round()
+    return df
+
+def draw_bboxes(frame, preds, w, h):
+    """Draw bounding boxes + labels on a BGR frame."""
+    count = 0
+    for _, row in preds.iterrows():
+        if not {"xmin","ymin","xmax","ymax"}.issubset(row.index):
+            continue
+        try:
+            x1, y1, x2, y2 = map(int,
+                                [row["xmin"], row["ymin"],
+                                 row["xmax"], row["ymax"]])
+        except Exception:
+            continue
+
+        # Clamp to bounds
+        x1 = max(0, min(x1, w - 1)); x2 = max(0, min(x2, w - 1))
+        y1 = max(0, min(y1, h - 1)); y2 = max(0, min(y2, h - 1))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0,0,255), 3)
+        label = str(row["track_id"]) if "track_id" in preds.columns and pd.notnull(row.get("track_id")) else "fish"
+        cv2.putText(frame, label, (x1, max(0, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        count += 1
+    return count
 
 ####################################
-# SAVE ZIP INTO UC VOLUME
+# SAVE ZIP INTO UC
 ####################################
 
 w = WorkspaceClient()
 uploaded_file = st.file_uploader("Upload a ZIP file with monitoring videos")
 
 if st.button("Save upload"):
-    if uploaded_file is None:
+    if not uploaded_file:
         st.error("Please upload a ZIP file.")
         st.stop()
 
@@ -51,221 +126,231 @@ if st.button("Save upload"):
         file_name = uploaded_file.name
 
         if not file_name.lower().endswith(".zip"):
-            st.error("Please upload a ZIP file.")
+            st.error("Must upload a ZIP.")
             st.stop()
 
         zf = zipfile.ZipFile(io.BytesIO(file_bytes))
 
-        # UC folder
         dest_folder = (
             "/Volumes/prd_dash_lab/dash_data_science_unrestricted/"
             "shared_external_volume/rachels_stuff/"
             f"{file_name.replace('.zip','')}"
         )
 
-        # Temp folder for previews
+        # Temp folder for QC raw videos
         temp_base = tempfile.mkdtemp(prefix="qc_videos_")
         st.session_state["temp_base_folder"] = temp_base
+        register_cleanup_once()
 
-        uploaded_mp4_paths = []
-        temp_mp4_paths = []
+        uploaded_uc = []
+        local_paths = []
 
-        for member in zf.namelist():
-            if not member.lower().endswith(".mp4"):
-                continue
-
-            fname = os.path.basename(member)
-            if not fname:
-                continue
-
-            file_content = zf.read(member)
-
-            # 1) Upload to UC
-            uc_path = f"{dest_folder}/{fname}"
-            w.files.upload(uc_path, io.BytesIO(file_content), overwrite=True)
-            uploaded_mp4_paths.append(uc_path)
-
-            # 2) Save local temp copy
-            temp_path = os.path.join(temp_base, fname)
-            with open(temp_path, "wb") as f:
-                f.write(file_content)
-            temp_mp4_paths.append(temp_path)
-
-        if not uploaded_mp4_paths:
+        mp4s = [m for m in zf.namelist() if m.lower().endswith(".mp4")]
+        if not mp4s:
             st.error("ZIP contained no .mp4 files.")
             st.stop()
 
-        st.session_state["input_df"] = pd.DataFrame({"fish": uploaded_mp4_paths})
-        st.session_state["uploaded_base_folder"] = dest_folder
-        st.session_state["uploaded_mp4_paths"] = uploaded_mp4_paths
-        st.session_state["temp_mp4_paths"] = temp_mp4_paths
+        prog = st.progress(0.0)
 
-        st.success(f"Uploaded {len(uploaded_mp4_paths)} videos into UC + local temp copies!")
+        for i, member in enumerate(mp4s, start=1):
+            fname = os.path.basename(member)
+            fbytes = zf.read(member)
+
+            # Upload to UC
+            uc_path = f"{dest_folder}/{fname}"
+            w.files.upload(uc_path, io.BytesIO(fbytes), overwrite=True)
+            uploaded_uc.append(uc_path)
+
+            # Local temp copy for QC
+            local_path = os.path.join(temp_base, fname)
+            with open(local_path, "wb") as f:
+                f.write(fbytes)
+            local_paths.append(local_path)
+
+            prog.progress(i / len(mp4s))
+
+        st.session_state["input_df"] = pd.DataFrame({"fish": uploaded_uc})
+        st.session_state["uploaded_mp4_paths"] = uploaded_uc
+        st.session_state["temp_mp4_paths"] = local_paths
+
+        prog.empty()
+        st.success("Upload complete.")
 
     except Exception as e:
         st.error(f"Error saving: {e}")
-            
+
 ####################################
-# Model Inference
+# MODEL INFERENCE
 ####################################
 
 st.subheader("🔍 Run Inference")
 
 if st.button("🚀 Start Inference"):
     if "input_df" not in st.session_state:
-        st.error("No saved file found. Upload and click 'Save changes' first.")
-    else:
-        input_df = st.session_state["input_df"]
+        st.error("No uploaded videos found. Upload first.")
+        st.stop()
 
-        if input_df.empty:
-            st.error("No videos prepared. Upload a ZIP and click 'Save changes' first.")
+    input_df = st.session_state["input_df"]
+    if input_df.empty:
+        st.error("Upload videos first.")
+        st.stop()
+
+    payload = {"fish": input_df["fish"].tolist()}
+
+    try:
+        response = w.serving_endpoints.query(
+            name="salmon_model_e",
+            inputs=payload
+        )
+        resp = response.as_dict() if hasattr(response, "as_dict") else dict(response)
+
+        preds = resp.get("predictions", [])
+        if not preds:
+            st.warning("Model returned no predictions.")
+            st.stop()
+
+        preds_df = pd.DataFrame(preds)
+
+        # Coerce types to be safe
+        preds_df = coerce_numeric(preds_df, ["frame","xmin","ymin","xmax","ymax","x1","y1","x2","y2"])
+
+        # ONLY NEEDED FIX: map x1/y1/x2/y2 to xmin/ymin/xmax/ymax
+        preds_df = standardise_bbox_columns(preds_df)
+
+        ####################################
+        # SUMMARY
+        ####################################
+
+        st.subheader("🐟 Fish Count Summary")
+
+        if "track_id" in preds_df.columns:
+            summary = (
+                preds_df.groupby("video")["track_id"]
+                .nunique()
+                .reset_index(name="unique_fish")
+            )
         else:
-            payload = {
-                "fish": input_df["fish"].astype(str).tolist()
-            }
+            summary = (
+                preds_df.groupby("video")
+                .size()
+                .reset_index(name="detections")
+            )
 
-            try:
-                # --- Call serving endpoint ---
-                response = w.serving_endpoints.query(
-                    name="salmon_model_e",
-                    inputs=payload
-                )
+        st.dataframe(summary, use_container_width=True)
 
-                resp_dict = response.as_dict() if hasattr(response, "as_dict") else dict(response)
+        ####################################
+        # QC BLOCK
+        ####################################
 
-                preds = resp_dict["predictions"]
-                preds_df = pd.DataFrame(preds)
+        st.subheader("🎥 QC: Review Input Videos")
 
-                 # --- Fish counts ---
+        videos = preds_df["video"].dropna().unique()
+        selected_video = st.selectbox("Select video:", videos)
 
-                st.subheader("🐟 Fish Count Summary")
-                if "track_id" in preds_df.columns:
-                    fish_counts = (
-                        preds_df.groupby("video")["track_id"]
-                        .nunique()
-                        .reset_index(name="unique_fish")
-                        .sort_values("unique_fish", ascending=False)
-                    )
-                else:
-                    fish_counts = (
-                        preds_df.groupby("video")
-                        .size()
-                        .reset_index(name="detections")
-                        .sort_values("detections", ascending=False)
-                    )
+        if not selected_video:
+            st.stop()
 
-                st.dataframe(fish_counts)
+        base = os.path.basename(selected_video)
+        raw_path = os.path.join(st.session_state["temp_base_folder"], base)
 
-                # ----------------------------------------------------
-                # QC BLOCK
-                # ----------------------------------------------------
+        if not os.path.exists(raw_path):
+            st.error("Local QC file missing.")
+            st.stop()
 
-                st.subheader("🎥 QC: Review Input Videos")
+        # Show raw
+        st.markdown("### 🎞️ Original Video")
+        with open(raw_path, "rb") as f:
+            st.video(f.read())
 
-                # Ensure predictions + paths are available
-                if (
-                    "input_df" in st.session_state 
-                    and "uploaded_mp4_paths" in st.session_state
-                    and "temp_base_folder" in st.session_state
-                ):
-                    videos = preds_df["video"].unique()
-                    selected_video = st.selectbox("Select a video:", videos)
+        ####################################
+        # ANNOTATED VIDEO (WEBM, robust matching)
+        ####################################
 
-                    if selected_video:
-                        # Local temp copy path
-                        base_name = os.path.basename(selected_video)
-                        temp_base = st.session_state["temp_base_folder"]
-                        temp_path = os.path.join(temp_base, base_name)
+        st.markdown("### 🟥 Annotated Video")
 
-                        if not os.path.exists(temp_path):
-                            st.error("Cannot find local temp copy. Re-upload ZIP.")
-                            st.stop()
+        vpreds = preds_df[preds_df["video"] == selected_video].copy()
+        if vpreds.empty:
+            st.info("No detections for this video.")
+            st.stop()
 
-                        # ------------------------------------------------
-                        # Show raw original video
-                        # ------------------------------------------------
-                        st.markdown("### 🎞️ Original Video")
-                        with open(temp_path, "rb") as f:
-                            st.video(f.read(), format="video/mp4")
+        if "frame" not in vpreds.columns:
+            st.info("'frame' column missing from predictions.")
+            st.stop()
 
-                        # ------------------------------------------------
-                        # Show annotated video with bounding boxes
-                        # ------------------------------------------------
-                        st.markdown("### 🟥 Video with Model Predictions")
+        # Open raw to get properties
+        cap = cv2.VideoCapture(raw_path)
+        if not cap.isOpened():
+            st.error("Cannot open raw video.")
+            st.stop()
 
-                        # Filter predictions for this video
-                        video_preds = preds_df[preds_df["video"] == selected_video].copy()
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        w_vid = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h_vid = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-                        if video_preds.empty:
-                            st.info("No detections found for this video.")
-                        else:
-                            # Temporary working directory for annotated frames/video
-                            work_dir = tempfile.mkdtemp(prefix="annot_frames_")
-                            frames_dir = os.path.join(work_dir, "frames")
-                            annotated_dir = os.path.join(work_dir, "annotated")
-                            os.makedirs(frames_dir, exist_ok=True)
-                            os.makedirs(annotated_dir, exist_ok=True)
+        # If boxes are normalized, scale in-place for this video subset
+        vpreds = maybe_scale_bboxes(vpreds, w_vid, h_vid)
 
-                            # Extract frames with ffmpeg
-                            extract_cmd = [
-                                "ffmpeg",
-                                "-i", temp_path,
-                                os.path.join(frames_dir, "frame_%06d.jpg"),
-                                "-hide_banner", "-loglevel", "error"
-                            ]
-                            subprocess.run(extract_cmd, check=True)
+        # Writer (WebM VP8)
+        work_dir = tempfile.mkdtemp(prefix="annot_")
+        out_path = os.path.join(work_dir, "annotated.webm")
+        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"VP80"), fps, (w_vid, h_vid))
 
-                            # -------------------------------------------
-                            # Draw bounding boxes
-                            # -------------------------------------------
-                            frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+        if not writer.isOpened():
+            st.error("Failed to open VP8 writer.")
+            cap.release()
+            safe_rmtree(work_dir)
+            st.stop()
 
-                            for frame_file in frame_files:
-                                frame_num = int(frame_file.split("_")[1].split(".")[0])
+        # Decide index base; still use a small window to be robust
+        one_based = (pd.notnull(vpreds["frame"].min()) and int(vpreds["frame"].min()) >= 1)
+        boxes_drawn_total = 0
+        frame_num = 0
 
-                                frame_path = os.path.join(frames_dir, frame_file)
-                                img = Image.open(frame_path).convert("RGB")
-                                draw = ImageDraw.Draw(img)
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-                                # Predictions for this frame
-                                frame_preds = video_preds[video_preds["frame"] == frame_num]
+            # Match frames with a small ±1 window to tolerate off-by-one
+            candidate = [frame_num-1, frame_num, frame_num+1]
+            if one_based:
+                candidate = [c+1 for c in candidate]  # shift if needed
 
-                                for _, row in frame_preds.iterrows():
-                                    x1, y1, x2, y2 = row["xmin"], row["ymin"], row["xmax"], row["ymax"]
+            pf = vpreds[vpreds["frame"].isin(candidate)]
 
-                                    # Draw bounding box
-                                    draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+            boxes_drawn_total += draw_bboxes(frame, pf, w_vid, h_vid)
+            writer.write(frame)
 
-                                    # Optional: draw label
-                                    label = row.get("track_id", "fish")
-                                    draw.text((x1, y1 - 10), str(label), fill="red")
+            frame_num += 1
 
-                                # Save annotated frame
-                                img.save(os.path.join(annotated_dir, frame_file))
+        cap.release()
+        writer.release()
 
-                            # -------------------------------------------
-                            # Reassemble into video
-                            # -------------------------------------------
-                            annotated_video_path = os.path.join(work_dir, "annotated.mp4")
+        # Basic debug
+        with st.expander("ℹ️ Annotation Debug"):
+            st.write({
+                "fps": fps, "width": w_vid, "height": h_vid,
+                "total_frames": total_frames,
+                "pred_rows_for_video": int(len(vpreds)),
+                "boxes_drawn_total": int(boxes_drawn_total)
+            })
 
-                            annotate_cmd = [
-                                "ffmpeg",
-                                "-framerate", "25",
-                                "-i", os.path.join(annotated_dir, "frame_%06d.jpg"),
-                                "-c:v", "libx264",
-                                "-pix_fmt", "yuv420p",
-                                annotated_video_path,
-                                "-hide_banner", "-loglevel", "error"
-                            ]
-                            subprocess.run(annotate_cmd, check=True)
+        # Play annotated
+        with open(out_path, "rb") as f:
+            st.video(f.read(), format="video/webm")
 
-                            # -------------------------------------------
-                            # Display annotated video
-                            # -------------------------------------------
-                            with open(annotated_video_path, "rb") as f:
-                                st.video(f.read(), format="video/mp4")
+        # Download button
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "⬇️ Download Annotated WebM",
+                data=f,
+                file_name="annotated.webm",
+                mime="video/webm"
+            )
 
-                            st.success("Annotated QC video generated!")
+        safe_rmtree(work_dir)
+        st.success("Annotation complete ✅")
 
-            except Exception as e:
-                st.error(f"Error saving: {e}")
+    except Exception as e:
+        st.error(f"Error during inference: {e}")
